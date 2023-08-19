@@ -1,0 +1,94 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import hashlib
+
+MESSAGE_SIZE = 1500
+TIMEOUT = 30
+ACK_SEQUENCE = 1
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.window = 2 #advertised window
+        self.packets_received = {}
+        self.list_of_ids = []
+        self.last_sent_ack = 0
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def queue_add(self, msg):
+        id = int(msg['sequence'])
+        data = msg['data']
+        if(id not in self.packets_received.keys()) and hashlib.md5(data.encode('utf-8')).hexdigest() == msg['checksum']:
+            self.packets_received[id] = msg
+            self.list_of_ids.append(id)
+            # self.list_of_ids.sort()
+        elif(id in self.packets_received.keys()):
+            self.ack(id)
+        #     self.window += 1
+
+            
+    def can_print(self):
+        for i in self.list_of_ids:
+            if i == self.last_sent_ack + 1:
+                # and (len(self.list_of_ids) <= self.window):
+                self.printl(i)
+                self.ack(i)
+                self.list_of_ids.remove(i)
+                # self.window += 1
+                self.last_sent_ack = i 
+            else:
+                self.log("cannot print now %s" %i)
+        self.log("last acked %s" % self.last_sent_ack)
+
+    def ack(self, seq):
+        self.log("sending ack for %s" % seq)
+        self.send({'type':'ack', 'sequence':seq, 'checksum': self.packets_received[seq]['checksum']})
+
+    def printl(self, seq):
+        print(self.packets_received[seq]['data'], end='', flush=True) 
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't alreadt have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+                
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                except (ValueError, KeyError, TypeError) as e:
+                    self.log(str(e))
+                    
+                self.log("Received data message %s" % msg)
+                
+                self.queue_add(msg)
+
+            self.can_print()
+
+            if len(self.list_of_ids) > 0: 
+                self.can_print()    
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

@@ -1,0 +1,153 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import hashlib
+import socket
+import time
+import json
+import select
+import struct
+import sys
+import math
+
+DATA_SIZE = 1375
+SEQUENCE = 1
+ADVERTISED_WINDOW = 10
+
+# time start sending packet
+start = time.time()
+
+# time elapsed
+def elapsed():
+    return time.time() - start
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False  # waiting for more acks to be received?
+
+        self.window = 4
+        self.rtt = 1
+        self.rto = self.rtt * 2
+        self.a = 0.875  # 0.875 for most TCPs
+        self.last_acked_sequence = 0
+        self.packets_sequence_to_send = []  # sequence numbers of packets to be sent
+        self.packet_queue = {}  # queue of packets to be sent (SEQUENCE as key)
+        self.all_acks = []  # all akcs received
+        self.list_of_unacked_ids = []  # unacked packets
+        self.last_of_times = {}
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    # add data to queue to be sent and update sequence numnber
+    def add_to_msg_queue(self, data):
+        global SEQUENCE
+        checksum = hashlib.md5(data.encode('utf-8')).hexdigest()
+        msg = {"type": "msg", "data": data, "sequence": SEQUENCE, "checksum": checksum}
+        self.packets_sequence_to_send.append(SEQUENCE)
+        self.packet_queue[SEQUENCE] = msg
+        SEQUENCE = SEQUENCE + 1
+
+    # send the next packet in queue
+    def send_next_packet(self):
+        # self.packets_sequence_to_send.sort()
+        id_to_send = self.packets_sequence_to_send.pop(0)
+        self.list_of_unacked_ids.append(id_to_send)
+        self.log("Sending message '%s'" % self.packet_queue[id_to_send])
+        self.last_of_times[id_to_send] = elapsed()
+        self.send(self.packet_queue[id_to_send])
+        # self.list_of_unacked_ids.sort()
+
+        if len(self.list_of_unacked_ids) >= self.window:  # if more acks to be received
+            self.log("waiting")
+            self.waiting = True
+
+    # did we recieve an ack for the messages sent
+    def ack_from_reciever(self, msg):
+        for i in self.list_of_unacked_ids:
+            if int(msg['sequence']) == int(i):  # if received ack for the message sent
+                self.log("acked %s" % i)
+                self.list_of_unacked_ids.remove(i) # remove from list of unacked
+                self.window += 1
+            else:
+                self.log("still unacked %s" % i)
+                    
+        if len(self.list_of_unacked_ids) < self.window:  # if no more acks to be received
+            self.log('no longer waiting')
+            self.waiting = False
+                
+        self.update_rrt(msg)
+
+    def update_rrt(self, msg):
+        # new_rtt = α (old_rtt) + (1 – α)(new_sample) 
+        # RTO = 2 * new_rtt (i.e. TCP is conservative) 
+        new_sample = elapsed() - self.last_of_times[msg["sequence"]]
+        self.rtt = self.a * self.rtt + (1 - self.a) * new_sample
+        self.rto = 2 * self.rtt
+
+    def check_according_to_rtt(self):
+        ifResent = False
+        for i in self.list_of_unacked_ids:
+            if elapsed() - self.last_of_times[i] > self.rto:
+                self.log("resending this packet %s" % i)
+                self.send(self.packet_queue[i])
+                self.last_of_times[i] = elapsed()
+                ifResent = True
+
+        if ifResent:
+            self.window = self.window / 2
+
+    def run(self):
+        while True:
+            self.check_according_to_rtt()
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+
+            socks = select.select(sockets, [], [], 0.1)[0]
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    
+                    try: 
+                        msg = json.loads(k.decode('utf-8'))
+                    except (ValueError, KeyError, TypeError) as e:
+                        self.log(str(e))
+                
+                    self.log("Received message '%s'" % msg)
+                    if msg['sequence'] not in self.all_acks:
+                        self.all_acks.append(msg['sequence'])
+                        self.ack_from_reciever(msg)
+
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+                    # finished senidng all packets
+                    if len(data) == 0 and len(self.list_of_unacked_ids) == 0:
+                        self.log("All done!")
+                        sys.exit(0)
+
+                    if len(data) != 0:
+                        self.add_to_msg_queue(data)  # add packet to queue
+
+                if len(self.packets_sequence_to_send) < ADVERTISED_WINDOW and len(self.packets_sequence_to_send) > 0 and not self.waiting:
+                # if not waiting for any acks and more packets need to be sent
+                # if not self.waiting and len(self.packets_sequence_to_send) > 0:
+                    self.send_next_packet()
+
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
